@@ -1,0 +1,15 @@
+[package]
+  name = "chirpstack-lorawan-stats"
+  description = "Collect LoRaWAN statistics (active devices, airtime) from ChirpStack Concentratord"
+  license = "MIT"
+  version = "0.1.0"
+  edition = "2024"
+  publish = false
+
+[dependencies]
+  anyhow = "1.0"
+  prost = { version = "0.14", default-features = false, features = [
+    "std",
+    "derive",
+  ] }
+  zmq = "0.10"

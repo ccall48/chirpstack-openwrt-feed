@@ -17,6 +17,7 @@ This repository contains packages to integrate ChirpStack components into
 * [ChirpStack Concentratord](https://www.chirpstack.io/docs/chirpstack-concentratord/)
 * [ChirpStack MQTT Forwarder](https://www.chirpstack.io/docs/chirpstack-mqtt-forwarder/)
 * [ChirpStack UDP Forwarder](https://github.com/chirpstack/chirpstack-udp-forwarder/)
+* [chirpstack-lorawan-stats](chirpstack/chirpstack-lorawan-stats/README.md) (LoRaWAN usage statistics: active devices, airtime)
 
 ### `/semtech`
 
