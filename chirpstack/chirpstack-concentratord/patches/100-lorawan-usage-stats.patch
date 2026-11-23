@@ -1,0 +1,634 @@
+diff --git a/chirpstack-concentratord-2g4/src/handler/jit.rs b/chirpstack-concentratord-2g4/src/handler/jit.rs
+index 69abdfd..5e5d9ae 100644
+--- a/chirpstack-concentratord-2g4/src/handler/jit.rs
++++ b/chirpstack-concentratord-2g4/src/handler/jit.rs
+@@ -32,6 +32,7 @@ pub fn jit_loop(
+         };
+ 
+         let downlink_id = tx_packet.get_id();
++        let time_on_air = tx_packet.get_time_on_air();
+         let mut tx_packet = tx_packet.tx_packet();
+         tx_packet.rf_power -= antenna_gain_dbi;
+ 
+@@ -49,6 +50,10 @@ pub fn jit_loop(
+                 if let Ok(tx_info) = wrapper::downlink_to_tx_info_proto(&tx_packet) {
+                     stats::inc_tx_counts(&tx_info);
+                 }
++
++                if let Ok(toa) = time_on_air {
++                    stats::inc_tx_airtime(toa);
++                }
+             }
+             Err(err) => {
+                 error!("Schedule packet for tx error, error: {}", err);
+diff --git a/chirpstack-concentratord-sx1301/src/handler/jit.rs b/chirpstack-concentratord-sx1301/src/handler/jit.rs
+index 2ddf245..5e9d174 100644
+--- a/chirpstack-concentratord-sx1301/src/handler/jit.rs
++++ b/chirpstack-concentratord-sx1301/src/handler/jit.rs
+@@ -33,6 +33,7 @@ pub fn jit_loop(
+         };
+ 
+         let downlink_id = tx_packet.get_id();
++        let time_on_air = tx_packet.get_time_on_air();
+         let mut tx_packet = tx_packet.tx_packet();
+         tx_packet.rf_power -= antenna_gain_dbi;
+ 
+@@ -51,6 +52,10 @@ pub fn jit_loop(
+                 if let Ok(tx_info) = wrapper::downlink_to_tx_info_proto(&tx_packet) {
+                     stats::inc_tx_counts(&tx_info);
+                 }
++
++                if let Ok(toa) = time_on_air {
++                    stats::inc_tx_airtime(toa);
++                }
+             }
+             Err(err) => {
+                 error!("Schedule packet for tx error, error: {}", err);
+diff --git a/chirpstack-concentratord-sx1302/src/handler/jit.rs b/chirpstack-concentratord-sx1302/src/handler/jit.rs
+index 94d20c1..b4dd417 100644
+--- a/chirpstack-concentratord-sx1302/src/handler/jit.rs
++++ b/chirpstack-concentratord-sx1302/src/handler/jit.rs
+@@ -32,6 +32,7 @@ pub fn jit_loop(
+         };
+ 
+         let downlink_id = tx_packet.get_id();
++        let time_on_air = tx_packet.get_time_on_air();
+         let mut tx_packet = tx_packet.tx_packet();
+         tx_packet.rf_power -= antenna_gain_dbi;
+ 
+@@ -50,6 +51,10 @@ pub fn jit_loop(
+                 if let Ok(tx_info) = wrapper::downlink_to_tx_info_proto(&tx_packet) {
+                     stats::inc_tx_counts(&tx_info);
+                 }
++
++                if let Ok(toa) = time_on_air {
++                    stats::inc_tx_airtime(toa);
++                }
+             }
+             Err(err) => {
+                 error!("Schedule packet for tx error, error: {}", err);
+diff --git a/libconcentratord/src/airtime.rs b/libconcentratord/src/airtime.rs
+new file mode 100644
+index 0000000..2b5e837
+--- /dev/null
++++ b/libconcentratord/src/airtime.rs
+@@ -0,0 +1,335 @@
++//! Time-on-air calculation for received (uplink) frames.
++//!
++//! Downlink time-on-air is provided by the HAL (lgw_time_on_air), but the HAL
++//! does not expose this for received packets. The formulas below are ported
++//! from the Semtech HALs so that uplink and downlink airtime are computed in
++//! the same way:
++//!
++//! * LoRa (sub-GHz): sx1302_hal, loragw_aux.c `lora_packet_time_on_air` with
++//!   the low data-rate optimization rule from the SX127x / SX126x datasheets
++//!   (enabled when the symbol time >= 16 ms).
++//! * LoRa (2.4 GHz): gateway_2g4_hal, loragw_hal.c `lgw_time_on_air`.
++//! * FSK: sx1302_hal, loragw_hal.c `lgw_time_on_air`.
++use std::time::Duration;
++
++use chirpstack_api::gw;
++
++// LoRaWAN uplinks always use an explicit header and a payload CRC.
++const UPLINK_CRC: bool = true;
++const UPLINK_HEADER: bool = true;
++
++// Default LoRaWAN preamble length (symbols).
++const LORA_PREAMBLE: u32 = 8;
++
++// FSK defaults (bytes) as used by the Semtech HAL.
++const FSK_PREAMBLE: u32 = 5;
++const FSK_SYNC_WORD: u32 = 3;
++
++// 2.4 GHz LoRa bandwidths as reported by the 2g4 HAL wrapper.
++const BW_2G4: [u32; 4] = [203000, 406000, 812000, 1625000];
++
++/// Returns the time-on-air of an uplink frame with the given modulation and
++/// PHYPayload size (bytes), or None if it can not be calculated.
++pub fn uplink_time_on_air(modulation: Option<&gw::Modulation>, size: usize) -> Option<Duration> {
++    match modulation?.parameters.as_ref()? {
++        gw::modulation::Parameters::Lora(v) => {
++            let preamble = if v.preamble > 0 {
++                v.preamble
++            } else {
++                default_preamble(v.spreading_factor)
++            };
++
++            if BW_2G4.contains(&v.bandwidth) {
++                lora_2g4_time_on_air(
++                    v.bandwidth,
++                    v.spreading_factor,
++                    v.code_rate(),
++                    preamble,
++                    size,
++                )
++            } else {
++                lora_time_on_air(
++                    v.bandwidth,
++                    v.spreading_factor,
++                    v.code_rate(),
++                    preamble,
++                    size,
++                )
++            }
++        }
++        gw::modulation::Parameters::Fsk(v) => fsk_time_on_air(v.datarate, size),
++        // LR-FHSS uplinks are not published by Concentratord.
++        gw::modulation::Parameters::LrFhss(_) => None,
++    }
++}
++
++fn default_preamble(sf: u32) -> u32 {
++    match sf {
++        5 | 6 => 12,
++        _ => LORA_PREAMBLE,
++    }
++}
++
++fn lora_time_on_air(
++    bw: u32,
++    sf: u32,
++    cr: gw::CodeRate,
++    preamble: u32,
++    size: usize,
++) -> Option<Duration> {
++    if bw == 0 || !(5..=12).contains(&sf) {
++        return None;
++    }
++
++    let cr: f64 = match cr {
++        gw::CodeRate::Cr45 | gw::CodeRate::CrUndefined => 1.0,
++        gw::CodeRate::Cr46 => 2.0,
++        gw::CodeRate::Cr47 => 3.0,
++        gw::CodeRate::Cr48 => 4.0,
++        _ => return None,
++    };
++
++    let sf_f = sf as f64;
++    let t_sym = (1u64 << sf) as f64 / bw as f64; // seconds
++
++    let h = if UPLINK_HEADER { 1.0 } else { 0.0 };
++    let crc = if UPLINK_CRC { 16.0 } else { 0.0 };
++    let de = if t_sym >= 0.016 { 1.0 } else { 0.0 };
++    let sf_ge_7 = sf >= 7;
++
++    let n_payload =
++        ((8.0 * size as f64 + crc - 4.0 * sf_f + if sf_ge_7 { 8.0 } else { 0.0 } + 20.0 * h)
++            .max(0.0)
++            / (4.0 * (sf_f - 2.0 * de)))
++            .ceil()
++            * (cr + 4.0);
++
++    let n_symbols = preamble as f64 + if sf_ge_7 { 4.25 } else { 6.25 } + 8.0 + n_payload;
++
++    Some(Duration::from_secs_f64(n_symbols * t_sym))
++}
++
++fn lora_2g4_time_on_air(
++    bw: u32,
++    sf: u32,
++    cr: gw::CodeRate,
++    preamble: u32,
++    size: usize,
++) -> Option<Duration> {
++    if !(5..=12).contains(&sf) {
++        return None;
++    }
++
++    // HAL coderate values: 1..4 = 4/5..4/8, 5..7 = LI 4/5, LI 4/6, LI 4/8.
++    let cr: u32 = match cr {
++        gw::CodeRate::Cr45 | gw::CodeRate::CrUndefined => 1,
++        gw::CodeRate::Cr46 => 2,
++        gw::CodeRate::Cr47 => 3,
++        gw::CodeRate::Cr48 => 4,
++        gw::CodeRate::CrLi45 => 5,
++        gw::CodeRate::CrLi46 => 6,
++        gw::CodeRate::CrLi48 => 7,
++        _ => return None,
++    };
++
++    let fine_synch = sf <= 6;
++    let long_interleaving = cr > 4;
++
++    // The HAL uses the bandwidth in kHz (rounded).
++    let bw_khz = match bw {
++        203000 => 203.0,
++        406000 => 406.0,
++        812000 => 812.0,
++        1625000 => 1625.0,
++        _ => return None,
++    };
++
++    let sym_period_ms = (1u64 << sf) as f64 / bw_khz;
++    let fec_rate = if long_interleaving {
++        4.0 / (cr + if cr == 7 { 1 } else { 0 }) as f64
++    } else {
++        4.0 / (4 + cr) as f64
++    };
++
++    let total_bytes = size as f64 + if UPLINK_CRC { 2.0 } else { 0.0 };
++    let bits_symbol = sf as f64 - if sf >= 11 { 2.0 } else { 0.0 };
++    let n_sym_header = if UPLINK_HEADER { 20.0 } else { 0.0 };
++    let mut infobits_header =
++        sf as f64 * 4.0 + if fine_synch { 8.0 } else { 0.0 } - 8.0 - n_sym_header;
++
++    let n_sym_data = if !long_interleaving {
++        let infobits_payload = (8.0 * total_bytes - infobits_header).max(0.0);
++        8.0 + (infobits_payload / 4.0 / bits_symbol).ceil() * (cr + 4) as f64
++    } else if UPLINK_HEADER {
++        if infobits_header < 8.0 * total_bytes {
++            infobits_header = infobits_header.min(8.0 * size as f64);
++        }
++        let infobits_payload = (8.0 * total_bytes - infobits_header).max(0.0);
++        8.0 + (infobits_payload / fec_rate / bits_symbol).ceil()
++    } else {
++        let bits_symbol_start = sf as f64 - 2.0 + if fine_synch { 2.0 } else { 0.0 };
++        let n_sym_start = (8.0 * total_bytes / fec_rate / bits_symbol_start).ceil();
++        if n_sym_start < 8.0 {
++            n_sym_start
++        } else {
++            let codedbits_header = bits_symbol_start * 8.0;
++            let codedbits_payload = 8.0 * total_bytes / fec_rate - codedbits_header;
++            8.0 + (codedbits_payload / bits_symbol).ceil()
++        }
++    };
++
++    let n_sym_preamble = preamble as f64 + 4.25 + if fine_synch { 2.0 } else { 0.0 };
++
++    Some(Duration::from_secs_f64(
++        (n_sym_preamble + n_sym_data) * sym_period_ms / 1000.0,
++    ))
++}
++
++fn fsk_time_on_air(datarate: u32, size: usize) -> Option<Duration> {
++    if datarate == 0 {
++        return None;
++    }
++
++    let crc = if UPLINK_CRC { 2 } else { 0 };
++    let bytes = FSK_PREAMBLE + FSK_SYNC_WORD + 1 + size as u32 + crc;
++
++    Some(Duration::from_secs_f64(
++        8.0 * bytes as f64 / datarate as f64,
++    ))
++}
++
++/// Returns the DevAddr of a LoRaWAN (R1) data uplink, or None if the
++/// PHYPayload is not a data uplink.
++pub fn uplink_dev_addr(phy_payload: &[u8]) -> Option<u32> {
++    // MHDR (1) + FHDR (min 7) + MIC (4)
++    if phy_payload.len() < 12 {
++        return None;
++    }
++
++    let mhdr = phy_payload[0];
++    let m_type = mhdr >> 5;
++    let major = mhdr & 0x03;
++
++    // 0b010 = UnconfirmedDataUp, 0b100 = ConfirmedDataUp
++    if major != 0 || (m_type != 0b010 && m_type != 0b100) {
++        return None;
++    }
++
++    Some(u32::from_le_bytes([
++        phy_payload[1],
++        phy_payload[2],
++        phy_payload[3],
++        phy_payload[4],
++    ]))
++}
++
++#[cfg(test)]
++mod test {
++    use super::*;
++
++    fn lora(bw: u32, sf: u32, cr: gw::CodeRate) -> gw::Modulation {
++        gw::Modulation {
++            parameters: Some(gw::modulation::Parameters::Lora(gw::LoraModulationInfo {
++                bandwidth: bw,
++                spreading_factor: sf,
++                code_rate: cr.into(),
++                ..Default::default()
++            })),
++        }
++    }
++
++    fn toa_ms(m: &gw::Modulation, size: usize) -> f64 {
++        uplink_time_on_air(Some(m), size).unwrap().as_secs_f64() * 1000.0
++    }
++
++    #[test]
++    fn test_lora_time_on_air() {
++        // Reference values: Semtech LoRa calculator (explicit header, CRC on,
++        // 8 symbol preamble, CR 4/5).
++        let tests = [
++            (125000, 7, 13, 46.336),
++            (125000, 7, 51, 102.656),
++            (125000, 9, 13, 164.864),
++            (125000, 10, 13, 288.768),
++            (125000, 11, 13, 577.536),
++            (125000, 12, 13, 1155.072),
++            (125000, 12, 51, 2465.792),
++            (500000, 8, 13, 20.608),
++            // Low data-rate optimization also applies to SF12 / 250 kHz.
++            (250000, 12, 13, 577.536),
++        ];
++
++        for (bw, sf, size, expected) in tests {
++            let m = lora(bw, sf, gw::CodeRate::Cr45);
++            let toa = toa_ms(&m, size);
++            assert!(
++                (toa - expected).abs() < 0.01,
++                "bw: {}, sf: {}, size: {}, expected: {}, got: {}",
++                bw,
++                sf,
++                size,
++                expected,
++                toa
++            );
++        }
++    }
++
++    #[test]
++    fn test_lora_2g4_time_on_air() {
++        // SF12, BW 812 kHz, CR 4/5, 8 symbol preamble, 13 bytes.
++        // Header bits: 12*4 - 8 - 20 = 20, payload bits: 15*8 - 20 = 100,
++        // data symbols: 8 + ceil(100 / 4 / 10) * 5 = 23, preamble: 12.25.
++        let m = lora(812000, 12, gw::CodeRate::Cr45);
++        let expected = (12.25 + 23.0) * 4096.0 / 812.0;
++        assert!((toa_ms(&m, 13) - expected).abs() < 0.001);
++    }
++
++    #[test]
++    fn test_fsk_time_on_air() {
++        let m = gw::Modulation {
++            parameters: Some(gw::modulation::Parameters::Fsk(gw::FskModulationInfo {
++                datarate: 50000,
++                ..Default::default()
++            })),
++        };
++        // (5 + 3 + 1 + 13 + 2) * 8 / 50000 = 3.84 ms
++        assert!((toa_ms(&m, 13) - 3.84).abs() < 0.001);
++    }
++
++    #[test]
++    fn test_no_modulation() {
++        assert!(uplink_time_on_air(None, 13).is_none());
++        assert!(uplink_time_on_air(Some(&gw::Modulation { parameters: None }), 13).is_none());
++    }
++
++    #[test]
++    fn test_uplink_dev_addr() {
++        // UnconfirmedDataUp, DevAddr 01020304 (LE on the wire).
++        let mut b = vec![0x40, 0x04, 0x03, 0x02, 0x01, 0x00, 0x00, 0x00];
++        b.extend_from_slice(&[0x00; 4]);
++        assert_eq!(Some(0x01020304), uplink_dev_addr(&b));
++
++        // ConfirmedDataUp.
++        b[0] = 0x80;
++        assert_eq!(Some(0x01020304), uplink_dev_addr(&b));
++
++        // JoinRequest.
++        b[0] = 0x00;
++        assert_eq!(None, uplink_dev_addr(&b));
++
++        // UnconfirmedDataDown.
++        b[0] = 0x60;
++        assert_eq!(None, uplink_dev_addr(&b));
++
++        // Proprietary (e.g. Gateway Mesh).
++        b[0] = 0xe0;
++        assert_eq!(None, uplink_dev_addr(&b));
++
++        // Non LoRaWAN R1 major.
++        b[0] = 0x41;
++        assert_eq!(None, uplink_dev_addr(&b));
++
++        // Too short.
++        assert_eq!(None, uplink_dev_addr(&[0x40, 0x04, 0x03, 0x02, 0x01]));
++    }
++}
+diff --git a/libconcentratord/src/lib.rs b/libconcentratord/src/lib.rs
+index 68af9fc..b6ccc83 100644
+--- a/libconcentratord/src/lib.rs
++++ b/libconcentratord/src/lib.rs
+@@ -1,6 +1,7 @@
+ #[macro_use]
+ extern crate anyhow;
+ 
++pub mod airtime;
+ pub mod commands;
+ pub mod error;
+ pub mod events;
+diff --git a/libconcentratord/src/stats.rs b/libconcentratord/src/stats.rs
+index 52b6c19..3715a3e 100644
+--- a/libconcentratord/src/stats.rs
++++ b/libconcentratord/src/stats.rs
+@@ -1,16 +1,122 @@
+ use std::collections::HashMap;
+ use std::sync::{LazyLock, Mutex};
+-use std::time::SystemTime;
++use std::time::{Duration, Instant, SystemTime};
+ 
+ use anyhow::Result;
+ use chirpstack_api::prost_types;
+ 
+-use super::events;
++use super::{airtime, events};
+ 
+ static STATS: LazyLock<Mutex<chirpstack_api::gw::GatewayStats>> =
+     LazyLock::new(|| Mutex::new(Default::default()));
+ 
++static USAGE: LazyLock<Mutex<Usage>> = LazyLock::new(|| Mutex::new(Usage::new(Instant::now())));
++
++const ACTIVE_DEVICES_1H: Duration = Duration::from_secs(60 * 60);
++const ACTIVE_DEVICES_24H: Duration = Duration::from_secs(24 * 60 * 60);
++
++// Upper bound on the number of tracked DevAddrs, to bound memory usage on
++// gateways that receive a very large number of (foreign) devices.
++const ACTIVE_DEVICES_MAX: usize = 100_000;
++
++/// Airtime and active device tracking. Unlike the GatewayStats counters,
++/// the totals and the device list are not reset on every stats interval.
++struct Usage {
++    rx_airtime_total: Duration,
++    tx_airtime_total: Duration,
++    rx_airtime_interval: Duration,
++    tx_airtime_interval: Duration,
++    interval_start: Instant,
++    devices: HashMap<u32, Instant>,
++}
++
++impl Usage {
++    fn new(now: Instant) -> Self {
++        Usage {
++            rx_airtime_total: Duration::ZERO,
++            tx_airtime_total: Duration::ZERO,
++            rx_airtime_interval: Duration::ZERO,
++            tx_airtime_interval: Duration::ZERO,
++            interval_start: now,
++            devices: HashMap::new(),
++        }
++    }
++
++    fn add_rx(&mut self, pl: &chirpstack_api::gw::UplinkFrame, now: Instant) {
++        if let Some(toa) = airtime::uplink_time_on_air(
++            pl.tx_info.as_ref().and_then(|v| v.modulation.as_ref()),
++            pl.phy_payload.len(),
++        ) {
++            self.rx_airtime_interval += toa;
++            self.rx_airtime_total += toa;
++        }
++
++        if let Some(dev_addr) = airtime::uplink_dev_addr(&pl.phy_payload) {
++            if self.devices.len() < ACTIVE_DEVICES_MAX || self.devices.contains_key(&dev_addr) {
++                self.devices.insert(dev_addr, now);
++            }
++        }
++    }
++
++    fn add_tx(&mut self, toa: Duration) {
++        self.tx_airtime_interval += toa;
++        self.tx_airtime_total += toa;
++    }
++
++    /// Adds the usage metrics to the given metadata and resets the interval
++    /// counters.
++    fn report_and_reset(&mut self, metadata: &mut HashMap<String, String>, now: Instant) {
++        self.devices
++            .retain(|_, last_seen| now.duration_since(*last_seen) < ACTIVE_DEVICES_24H);
++
++        let active_1h = self
++            .devices
++            .values()
++            .filter(|last_seen| now.duration_since(**last_seen) < ACTIVE_DEVICES_1H)
++            .count();
++
++        let elapsed = now.duration_since(self.interval_start);
++        let pct = |d: Duration| {
++            if elapsed.is_zero() {
++                0.0
++            } else {
++                d.as_secs_f64() / elapsed.as_secs_f64() * 100.0
++            }
++        };
++
++        metadata.insert("active_devices_1h".into(), active_1h.to_string());
++        metadata.insert("active_devices_24h".into(), self.devices.len().to_string());
++        metadata.insert(
++            "rx_airtime_ms_total".into(),
++            self.rx_airtime_total.as_millis().to_string(),
++        );
++        metadata.insert(
++            "tx_airtime_ms_total".into(),
++            self.tx_airtime_total.as_millis().to_string(),
++        );
++        metadata.insert(
++            "rx_airtime_pct".into(),
++            format!("{:.2}", pct(self.rx_airtime_interval)),
++        );
++        metadata.insert(
++            "tx_airtime_pct".into(),
++            format!("{:.2}", pct(self.tx_airtime_interval)),
++        );
++
++        self.rx_airtime_interval = Duration::ZERO;
++        self.tx_airtime_interval = Duration::ZERO;
++        self.interval_start = now;
++    }
++}
++
++/// Track the time-on-air of a transmitted (downlink) packet.
++pub fn inc_tx_airtime(toa: Duration) {
++    USAGE.lock().unwrap().add_tx(toa);
++}
++
+ pub fn inc_rx_counts(pl: &chirpstack_api::gw::UplinkFrame) {
++    USAGE.lock().unwrap().add_rx(pl, Instant::now());
++
+     let mut stats = STATS.lock().unwrap();
+     stats.rx_packets_received_ok += 1;
+ 
+@@ -100,6 +206,10 @@ pub fn send_and_reset(
+     stats.location = location;
+     stats.duty_cycle_stats = duty_cycle_stats;
+     stats.metadata.clone_from(metadata);
++    USAGE
++        .lock()
++        .unwrap()
++        .report_and_reset(&mut stats.metadata, Instant::now());
+ 
+     events::send_stats(stats.clone()).unwrap();
+ 
+@@ -108,3 +218,71 @@ pub fn send_and_reset(
+ 
+     Ok(())
+ }
++
++#[cfg(test)]
++mod test {
++    use super::*;
++    use chirpstack_api::gw;
++
++    fn uplink(dev_addr: u32) -> gw::UplinkFrame {
++        let mut phy = vec![0x40];
++        phy.extend_from_slice(&dev_addr.to_le_bytes());
++        phy.extend_from_slice(&[0x00; 8]); // FCtrl, FCnt, FPort, MIC (13 bytes total)
++
++        gw::UplinkFrame {
++            phy_payload: phy,
++            tx_info: Some(gw::UplinkTxInfo {
++                frequency: 916_800_000,
++                modulation: Some(gw::Modulation {
++                    parameters: Some(gw::modulation::Parameters::Lora(gw::LoraModulationInfo {
++                        bandwidth: 125000,
++                        spreading_factor: 7,
++                        code_rate: gw::CodeRate::Cr45.into(),
++                        ..Default::default()
++                    })),
++                }),
++            }),
++            ..Default::default()
++        }
++    }
++
++    #[test]
++    fn test_usage() {
++        let start = Instant::now();
++        let mut u = Usage::new(start);
++
++        // 13 byte SF7 / 125 kHz uplink = 46.336 ms.
++        u.add_rx(&uplink(1), start);
++        u.add_rx(&uplink(1), start);
++        u.add_rx(&uplink(2), start + Duration::from_secs(2 * 60 * 60));
++        u.add_tx(Duration::from_millis(300));
++
++        let now = start + Duration::from_secs(2 * 60 * 60) + Duration::from_secs(30);
++        let mut md = HashMap::new();
++        u.report_and_reset(&mut md, now);
++
++        assert_eq!("1", md["active_devices_1h"]);
++        assert_eq!("2", md["active_devices_24h"]);
++        assert_eq!("139", md["rx_airtime_ms_total"]);
++        assert_eq!("300", md["tx_airtime_ms_total"]);
++        // 300 ms / 7230 s
++        assert_eq!("0.00", md["tx_airtime_pct"]);
++
++        // Second interval of 10 s, interval counters must be reset.
++        u.add_tx(Duration::from_millis(500));
++        let now = now + Duration::from_secs(10);
++        let mut md = HashMap::new();
++        u.report_and_reset(&mut md, now);
++
++        assert_eq!("0.00", md["rx_airtime_pct"]);
++        assert_eq!("5.00", md["tx_airtime_pct"]);
++        assert_eq!("800", md["tx_airtime_ms_total"]);
++
++        // Devices expire after 24h.
++        let now = start + Duration::from_secs(24 * 60 * 60) + Duration::from_secs(1);
++        let mut md = HashMap::new();
++        u.report_and_reset(&mut md, now);
++        assert_eq!("0", md["active_devices_1h"]);
++        assert_eq!("1", md["active_devices_24h"]);
++    }
++}
